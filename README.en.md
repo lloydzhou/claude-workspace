@@ -1,6 +1,6 @@
-# Claude Cluster
+# Claude Workspace
 
-Claude Cluster is a session-based Claude workspace built on OpenResty + Nchan.
+Claude Workspace is a session-based Claude workspace built on OpenResty + Nchan.
 
 The current implementation is intentionally CGI-like:
 

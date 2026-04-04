@@ -1,6 +1,6 @@
-# Claude Cluster
+# Claude Workspace
 
-Claude Cluster 是一个基于 OpenResty + Nchan 的会话式 Claude 工作区。
+Claude Workspace 是一个基于 OpenResty + Nchan 的会话式 Claude 工作区。
 
 当前实现采用的是 **CGI-like turn** 模式：
 
