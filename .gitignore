@@ -4,3 +4,4 @@ projects/
 logs/*.log
 logs/*.pid
 node_modules/
+html/
