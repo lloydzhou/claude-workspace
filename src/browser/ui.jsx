@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { formatAttachmentChip } from '../shared/attachments.js';
 
 window.ClaudeWorkspaceReact = true;
 
@@ -109,9 +110,12 @@ function QueueView({ state }) {
   return (
     <>
       {queue.map((item, idx) => (
-        <div className="queue-chip" key={`${idx}-${item}`}>
+        <div className="queue-chip" key={`${idx}-${item?.text || String(item) || ''}`}>
           <strong>#{idx + 1}</strong>
-          <span className="queue-item-text">{item.length > 72 ? `${item.slice(0, 72)}…` : item}</span>
+          <span className="queue-item-text">
+            {String(item?.text || item || '').length > 72 ? `${String(item?.text || item || '').slice(0, 72)}…` : String(item?.text || item || '')}
+            {item?.attachments && item.attachments.length ? ` · ${item.attachments.length} attachment${item.attachments.length === 1 ? '' : 's'}` : ''}
+          </span>
         </div>
       ))}
     </>
@@ -203,19 +207,28 @@ function TranscriptView({ state }) {
     return messages.map((msg, idx) => {
       const body = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
       const pending = msg.pending ? ' pending' : '';
-      if (msg.role === 'assistant' && !String(body || '').trim()) {
+      if (msg.role === 'assistant' && msg.kind !== 'thinking' && !String(body || '').trim()) {
         return null;
       }
+      const isThinking = msg.kind === 'thinking';
+      const isToolUse = msg.kind === 'tool_use';
       const isToolCall = isLikelyToolCall(msg, body);
       const isToolResult = isLikelyToolResult(msg, body);
-      const role = isToolCall || isToolResult ? 'tool' : (msg.role || 'system');
-      const label = msg.kind === 'result'
-        ? 'result'
-        : (isToolCall ? 'tool call' : (isToolResult ? 'tool result' : (msg.kind || role)));
-      const displayBody = body || (msg.kind === 'result' ? describeSystemEvent(msg) : '');
+      const role = isThinking ? 'thinking' : ((isToolUse || isToolCall || isToolResult) ? 'tool' : (msg.role || 'system'));
+      const label = isThinking
+        ? 'thinking'
+        : (msg.kind === 'result'
+          ? 'result'
+          : (isToolUse ? `tool use${msg.tool_name ? `: ${msg.tool_name}` : ''}`
+            : (isToolCall ? 'tool call' : (isToolResult ? 'tool result' : (msg.kind || role)))));
+      const displayBody = body || (msg.kind === 'thinking'
+        ? 'thinking…'
+        : (msg.kind === 'result' ? describeSystemEvent(msg) : ''));
       let bodyTag;
       let toolLabel = label;
-      if (role === 'assistant') {
+      if (role === 'thinking') {
+        bodyTag = <pre className="message-body thinking-body">{displayBody}</pre>;
+      } else if (role === 'assistant') {
         bodyTag = <div className="message-body markdown-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(displayBody) }} />;
       } else if (role === 'tool') {
         const toolResult = renderToolBody(displayBody);
@@ -258,6 +271,8 @@ function AppShell() {
   const transcriptRef = useRef(null);
   const inputRef = useRef(null);
   const [inputValue, setInputValue] = useState('');
+  const [attachments, setAttachments] = useState([]);
+  const attachmentUpload = helper('uploadAttachment') || (() => Promise.reject(new Error('upload unavailable')));
   const loadSessions = helper('loadSessions') || (() => Promise.resolve());
   const createSession = helper('createSession') || (() => Promise.resolve());
   const deleteCurrentSession = helper('deleteCurrentSession') || (() => Promise.resolve());
@@ -272,6 +287,17 @@ function AppShell() {
 
   useEffect(() => {
     setInputValue('');
+  }, [sid]);
+
+  useEffect(() => {
+    setAttachments((prev) => {
+      prev.forEach((attachment) => {
+        if (attachment.previewUrl) {
+          URL.revokeObjectURL(attachment.previewUrl);
+        }
+      });
+      return [];
+    });
   }, [sid]);
 
   useEffect(() => {
@@ -291,10 +317,16 @@ function AppShell() {
 
   const handleSend = () => {
     const text = inputValue.trim();
-    if (!text) return;
-    const ok = sendCurrentInput(text);
+    if (!text && !attachments.length) return;
+    const ok = sendCurrentInput(text, attachments);
     if (ok !== false) {
       setInputValue('');
+      attachments.forEach((attachment) => {
+        if (attachment.previewUrl) {
+          URL.revokeObjectURL(attachment.previewUrl);
+        }
+      });
+      setAttachments([]);
     }
   };
 
@@ -307,6 +339,70 @@ function AppShell() {
 
   const handleInputChange = (e) => {
     setInputValue(e.target.value);
+  };
+
+  const uploadFiles = async (files) => {
+    if (!sid || !files.length) {
+      return;
+    }
+    for (const file of files) {
+      const previewUrl = file.type && file.type.startsWith('image/') ? URL.createObjectURL(file) : '';
+      try {
+        const uploaded = await attachmentUpload(sid, file);
+        setAttachments((prev) => prev.concat([{
+          id: uploaded.id,
+          filename: uploaded.filename || file.name,
+          mimeType: uploaded.mime_type || file.type,
+          serverPath: uploaded.server_path,
+          size: uploaded.size || file.size || 0,
+          previewUrl,
+        }]));
+      } catch (err) {
+        if (previewUrl) {
+          URL.revokeObjectURL(previewUrl);
+        }
+        // eslint-disable-next-line no-console
+        console.error('Attachment upload failed:', err);
+      }
+    }
+  };
+
+  const handleFilesSelected = async (e) => {
+    const files = Array.from(e.target.files || []);
+    await uploadFiles(files);
+  };
+
+  const handlePaste = async (e) => {
+    if (!sid) return;
+    const clipboardItems = Array.from(e.clipboardData?.items || []);
+    const files = [];
+    for (const item of clipboardItems) {
+      if (!item) continue;
+      if (item.kind === 'file') {
+        const file = typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+        if (file && file.type && file.type.startsWith('image/')) {
+          files.push(file);
+        }
+      }
+    }
+    if (!files.length) {
+      const clipboardFiles = Array.from(e.clipboardData?.files || []).filter((file) => file && file.type && file.type.startsWith('image/'));
+      files.push(...clipboardFiles);
+    }
+    if (!files.length) return;
+    e.preventDefault();
+    await uploadFiles(files);
+  };
+
+  const handleRemoveAttachment = (id) => {
+    setAttachments((prev) => {
+      const next = prev.filter((attachment) => attachment.id !== id);
+      const removed = prev.find((attachment) => attachment.id === id);
+      if (removed && removed.previewUrl) {
+        URL.revokeObjectURL(removed.previewUrl);
+      }
+      return next;
+    });
   };
 
   const handleTranscriptScroll = (e) => {
@@ -420,6 +516,22 @@ function AppShell() {
         </section>
 
         <footer className="composer">
+          <div className="attachment-strip">
+            {attachments.length ? attachments.map((attachment, idx) => (
+              <div className="attachment-chip" key={attachment.id || `${attachment.filename}-${idx}`}>
+                {attachment.previewUrl ? (
+                  <img className="attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} />
+                ) : (
+                  <div className="attachment-thumb attachment-thumb-empty">IMG</div>
+                )}
+                <div className="attachment-copy">
+                  <div className="attachment-name">{formatAttachmentChip(idx + 1, attachment)}</div>
+                  <div className="attachment-path">{attachment.serverPath}</div>
+                </div>
+                <button type="button" className="attachment-remove" onClick={() => handleRemoveAttachment(attachment.id)}>×</button>
+              </div>
+            )) : null}
+          </div>
           <div className="queue-strip" id="queue-strip">
             <QueueView state={state} />
           </div>
@@ -435,12 +547,13 @@ function AppShell() {
                 value={inputValue}
                 onChange={handleInputChange}
                 onKeyDown={handleInputKeyDown}
+                onPaste={handlePaste}
               ></textarea>
             </div>
-            <button id="btn-send" className="primary-btn" disabled={!sid || sending || !inputValue.trim()} onClick={handleSend}>Send</button>
+            <button id="btn-send" className="primary-btn" disabled={!sid || sending || (!inputValue.trim() && !attachments.length)} onClick={handleSend}>Send</button>
           </div>
           <div className="hint-line">
-            <span>Enter to send, <code>Shift+Enter</code> for newline.</span>
+            <span>Paste images directly into the composer.</span>
             <span>Input is queued in the browser while a turn is running.</span>
           </div>
         </footer>

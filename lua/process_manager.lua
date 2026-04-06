@@ -47,6 +47,107 @@ local function shell_join(args)
     return table.concat(parts, " ")
 end
 
+local function normalize_body(body)
+    if type(body) == "table" then
+        return body
+    end
+    if type(body) ~= "string" then
+        return { content = "" }
+    end
+    local decoded = utils.json_decode(body)
+    if type(decoded) == "table" then
+        return decoded
+    end
+    return { content = body }
+end
+
+local function normalize_attachments(body)
+    local payload = normalize_body(body)
+    local list = payload.attachments
+    if type(list) ~= "table" then
+        return {}
+    end
+    local attachments = {}
+    for _, item in ipairs(list) do
+        if type(item) == "string" then
+            table.insert(attachments, {
+                server_path = item,
+                filename = item:match("[^/]+$") or item,
+            })
+        elseif type(item) == "table" then
+            table.insert(attachments, {
+                server_path = item.server_path or item.serverPath or item.path or item.file_path or "",
+                filename = item.filename or item.name or ((item.server_path or item.serverPath or item.path or item.file_path or ""):match("[^/]+$") or "attachment"),
+                mime_type = item.mime_type or item.mimeType or item.content_type,
+            })
+        end
+    end
+    return attachments
+end
+
+local function extract_turn_text(body)
+    local payload = normalize_body(body)
+    local text = payload.content
+    if type(text) ~= "string" then
+        if type(payload.message) == "table" then
+            local msg_content = payload.message.content
+            if type(msg_content) == "string" then
+                text = msg_content
+            elseif type(msg_content) == "table" and msg_content[1] and msg_content[1].text then
+                text = msg_content[1].text
+            end
+        end
+    end
+    return tostring(text or "")
+end
+
+local function build_attachment_prompt(attachments, text)
+    attachments = attachments or {}
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if #attachments == 0 then
+        return text
+    end
+
+    local lines = {}
+    table.insert(lines, "You must read these local image files first with the Read tool.")
+    table.insert(lines, "Do not use analyze_image or any other server_tool_use for these files.")
+    table.insert(lines, "Read each file path directly as written below:")
+    for _, attachment in ipairs(attachments) do
+        if attachment.server_path and attachment.server_path ~= "" then
+            table.insert(lines, "- " .. attachment.server_path)
+        end
+    end
+    table.insert(lines, "")
+    if text ~= "" then
+        table.insert(lines, "Then answer the user's request:")
+        table.insert(lines, text)
+    else
+        table.insert(lines, "Then describe what you observe in the attached images.")
+    end
+    return table.concat(lines, "\n")
+end
+
+local function build_turn_prompt(body)
+    local payload = normalize_body(body)
+    return build_attachment_prompt(normalize_attachments(payload), extract_turn_text(payload))
+end
+
+local function build_stream_json_input_line(session_id, body)
+    local prompt = build_turn_prompt(body)
+    local event_uuid = (normalize_body(body).uuid) or utils.uuid()
+    return utils.json_encode({
+        type = "user",
+        content = prompt,
+        uuid = event_uuid,
+        session_id = session_id,
+        message = {
+            role = "user",
+            content = prompt,
+        },
+        parent_tool_use_id = nil,
+    })
+end
+
 local function ensure_session_repo(session_dir)
     local git_dir = session_dir .. "/.git"
     local probe = io.open(git_dir, "r")
@@ -65,29 +166,9 @@ local function ensure_session_repo(session_dir)
 end
 
 local function build_user_event_line(body, session_id)
-    local payload = body
-    if type(payload) ~= "table" then
-        local decoded = utils.json_decode(body)
-        if decoded then
-            payload = decoded
-        else
-            payload = { content = tostring(body or "") }
-        end
-    end
-
-    local text = payload.content
-    if type(text) ~= "string" then
-        if type(payload.message) == "table" then
-            local msg_content = payload.message.content
-            if type(msg_content) == "string" then
-                text = msg_content
-            elseif type(msg_content) == "table" and msg_content[1] and msg_content[1].text then
-                text = msg_content[1].text
-            end
-        end
-    end
-
-    text = tostring(text or "")
+    local payload = normalize_body(body)
+    local text = build_turn_prompt(payload)
+    local attachments = normalize_attachments(payload)
     local event_uuid = payload.uuid or utils.uuid()
     local content = {
         { type = "text", text = text }
@@ -101,6 +182,7 @@ local function build_user_event_line(body, session_id)
             role = "user",
             content = content
         },
+        attachments = attachments,
         session_id = session_id,
         uuid = event_uuid,
         isReplay = true,
@@ -108,20 +190,23 @@ local function build_user_event_line(body, session_id)
 end
 
 local function is_turn_request(body)
-    if type(body) ~= "table" then
-        local decoded = utils.json_decode(body)
-        if not decoded then
-            return false
-        end
-        body = decoded
-    end
-    if type(body) ~= "table" then
-        return false
-    end
+    body = normalize_body(body)
     if body.type == "turn_request" then
         return true
     end
     return body.type == "user" and body.session_id == nil
+end
+
+local function summarize_turn(body)
+    local text = extract_turn_text(body)
+    if text ~= "" then
+        return text
+    end
+    local attachments = normalize_attachments(body)
+    if #attachments > 0 then
+        return tostring(#attachments) .. " attachment" .. (#attachments == 1 and "" or "s")
+    end
+    return ""
 end
 
 local function extract_text_message(msg)
@@ -261,7 +346,7 @@ end
 local function publish_user_event(session_id, body)
     local payload = build_user_event_line(body, session_id)
     upsert_session(session_id, {
-        last_user_text = extract_text_message(type(body) == "string" and utils.json_decode(body) or body),
+        last_user_text = summarize_turn(body),
         last_input_at = ngx.now(),
     })
     publish_to_session(session_id, payload)
@@ -388,7 +473,7 @@ local function run_turn(session_id, body, session_dir)
         return proc:wait()
     end)
 
-    local input = build_user_event_line(body, session_id)
+    local input = build_stream_json_input_line(session_id, body)
     if input:sub(-1) ~= "\n" then
         input = input .. "\n"
     end
@@ -474,7 +559,7 @@ function _M.spawn(session_id, body)
 
     local prefix = ngx.config.prefix()
     local session_dir = os.getenv("CLAUDE_WORKSPACE_DIR") or (prefix .. "projects/" .. session_id)
-    os.execute("mkdir -p " .. session_dir)
+    os.execute("mkdir -p " .. shell_quote(session_dir))
     local repo_ok, repo_err = ensure_session_repo(session_dir)
     if not repo_ok then
         return nil, repo_err or "failed to init session repo"

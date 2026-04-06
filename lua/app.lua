@@ -5,6 +5,7 @@
 local router = require "router"
 local utils = require "utils"
 local pm = require "process_manager"
+local upload_manager = require "upload_manager"
 
 local _M = {}
 
@@ -115,6 +116,35 @@ local function build_router()
         end
 
         utils.json_response({ status = "queued", session_id = session_id }, 202)
+    end)
+
+    r:post("/api/sessions/:id/uploads", function(params)
+        local session_id = params.id
+        if not utils.is_uuid(session_id) then
+            utils.error_response("invalid session id", 400)
+            return
+        end
+        local info = pm.get(session_id)
+        if not info then
+            utils.error_response("session not found", 404)
+            return
+        end
+
+        local headers = ngx.req.get_headers()
+        local raw_body = utils.read_raw_body()
+        local uploaded, err = upload_manager.save(session_id, {
+            filename = headers["X-Filename"] or headers["x-filename"] or headers["X-Upload-Filename"] or headers["x-upload-filename"] or headers["Content-Disposition"] or headers["content-disposition"],
+            mime_type = headers["Content-Type"] or headers["content-type"],
+        }, raw_body)
+        if not uploaded then
+            utils.error_response(err or "failed to upload file", 400)
+            return
+        end
+
+        utils.json_response({
+            uploaded = uploaded,
+            session_id = session_id,
+        }, 201)
     end)
 
     -- --- Health check ---

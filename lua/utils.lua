@@ -93,6 +93,22 @@ function _M.read_body()
     return body
 end
 
+function _M.read_raw_body()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data()
+    if not body then
+        local file = ngx.req.get_body_file()
+        if file then
+            local f = io.open(file, "rb")
+            if f then
+                body = f:read("*a")
+                f:close()
+            end
+        end
+    end
+    return body
+end
+
 function _M.json_encode(data)
     return cjson.encode(data)
 end

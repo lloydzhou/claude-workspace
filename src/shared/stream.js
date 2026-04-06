@@ -55,6 +55,34 @@ function extractTextValue(value) {
   return '';
 }
 
+function getAssistantContentBlocks(action) {
+  if (!action || typeof action !== 'object') return [];
+  const candidates = [
+    action.content,
+    action.raw && action.raw.content,
+    action.message && action.message.content,
+    action.raw && action.raw.message && action.raw.message.content,
+  ];
+  for (const blocks of candidates) {
+    if (Array.isArray(blocks) && blocks.length) return blocks;
+  }
+  return [];
+}
+
+function extractThinkingText(action) {
+  const blocks = getAssistantContentBlocks(action);
+  const parts = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type !== 'thinking') continue;
+    const text = typeof block.thinking === 'string'
+      ? block.thinking
+      : (typeof block.text === 'string' ? block.text : extractTextValue(block.content));
+    if (text) parts.push(text);
+  }
+  return parts.join('\n\n');
+}
+
 function normalizeAction(payload, source = 'remote') {
   if (!payload || typeof payload !== 'object') {
     return {
@@ -84,9 +112,10 @@ function normalizeAction(payload, source = 'remote') {
 
 function actionText(action) {
   if (!action || typeof action !== 'object') return '';
-  if (action.type === 'assistant' && Array.isArray(action.content)) {
+  if (action.type === 'assistant') {
+    const blocks = getAssistantContentBlocks(action);
     const textParts = [];
-    for (const block of action.content) {
+    for (const block of blocks) {
       if (block && block.type === 'text' && typeof block.text === 'string') {
         textParts.push(block.text);
       }
@@ -166,6 +195,9 @@ function reduceTranscriptActions(actions) {
 
   const messages = [];
   let assistantDraft = null;
+  let thinkingDraft = null;
+  let toolDraft = null;
+  let activeStreamBlockKind = null;
   const hasStreamEvent = actions.some((action) => !!extractStreamEvent(action));
 
   const pushMessage = (message) => {
@@ -191,6 +223,74 @@ function reduceTranscriptActions(actions) {
     assistant.content += text;
     assistant.timestamp = timestamp || assistant.timestamp || nowIso();
     assistant.pending = true;
+  };
+
+  const startThinking = (timestamp) => {
+    if (thinkingDraft) return thinkingDraft;
+    finalizeAssistant();
+    thinkingDraft = pushMessage({
+      id: `thinking-${messages.length}-${Date.now()}`,
+      role: 'assistant',
+      kind: 'thinking',
+      content: '',
+      timestamp: timestamp || nowIso(),
+      pending: true,
+    });
+    return thinkingDraft;
+  };
+
+  const appendThinkingText = (text, timestamp) => {
+    if (!text) return;
+    const thinking = startThinking(timestamp);
+    thinking.content += text;
+    thinking.timestamp = timestamp || thinking.timestamp || nowIso();
+    thinking.pending = true;
+  };
+
+  const startToolUse = (timestamp, toolBlock = null) => {
+    if (toolDraft) return toolDraft;
+    finalizeAssistant();
+    finalizeThinking();
+    toolDraft = pushMessage({
+      id: `tool-${messages.length}-${Date.now()}`,
+      role: 'tool',
+      kind: 'tool_use',
+      tool_name: toolBlock && toolBlock.name ? toolBlock.name : '',
+      content: '',
+      timestamp: timestamp || nowIso(),
+      pending: true,
+    });
+    return toolDraft;
+  };
+
+  const appendToolInput = (text, timestamp) => {
+    if (!text) return;
+    const tool = startToolUse(timestamp);
+    tool.content += text;
+    tool.timestamp = timestamp || tool.timestamp || nowIso();
+    tool.pending = true;
+  };
+
+  const finalizeToolUse = () => {
+    if (toolDraft) {
+      if (!String(toolDraft.content || '').trim()) {
+        messages.pop();
+      } else {
+        toolDraft.pending = false;
+      }
+      toolDraft = null;
+    }
+  };
+
+  const finalizeThinking = () => {
+    if (thinkingDraft) {
+      if (!String(thinkingDraft.content || '').trim()) {
+        messages.pop();
+      } else {
+        thinkingDraft.pending = false;
+      }
+      thinkingDraft = null;
+    }
   };
 
   const finalizeAssistant = () => {
@@ -223,7 +323,24 @@ function reduceTranscriptActions(actions) {
     const ev = extractStreamEvent(action);
     if (ev) {
       const stamp = action.timestamp || nowIso();
+      if (ev.type === 'content_block_start' && ev.content_block) {
+        activeStreamBlockKind = ev.content_block.type || null;
+        if (activeStreamBlockKind === 'thinking') {
+          startThinking(stamp);
+        } else if (activeStreamBlockKind === 'tool_use') {
+          startToolUse(stamp, ev.content_block);
+        }
+        continue;
+      }
       if (ev.type === 'content_block_delta' && ev.delta) {
+        if (ev.delta.type === 'thinking_delta' || typeof ev.delta.thinking === 'string') {
+          appendThinkingText(ev.delta.thinking || ev.delta.text || '', stamp);
+          continue;
+        }
+        if (ev.delta.type === 'input_json_delta' || typeof ev.delta.partial_json === 'string') {
+          appendToolInput(ev.delta.partial_json || ev.delta.text || '', stamp);
+          continue;
+        }
         if (typeof ev.delta.text === 'string') {
           appendAssistantText(ev.delta.text, stamp);
           continue;
@@ -234,6 +351,14 @@ function reduceTranscriptActions(actions) {
         }
       }
       if (ev.type === 'message_delta' && ev.delta) {
+        if (ev.delta.type === 'thinking_delta' || typeof ev.delta.thinking === 'string') {
+          appendThinkingText(ev.delta.thinking || ev.delta.text || '', stamp);
+          continue;
+        }
+        if (ev.delta.type === 'input_json_delta' || typeof ev.delta.partial_json === 'string') {
+          appendToolInput(ev.delta.partial_json || ev.delta.text || '', stamp);
+          continue;
+        }
         if (typeof ev.delta.text === 'string') appendAssistantText(ev.delta.text, stamp);
         continue;
       }
@@ -241,14 +366,78 @@ function reduceTranscriptActions(actions) {
         appendAssistantText(ev.text, stamp);
         continue;
       }
-      if (ev.type === 'content_block_stop' || ev.type === 'message_stop') {
+      if (ev.type === 'content_block_stop') {
+        if (activeStreamBlockKind === 'thinking') {
+          finalizeThinking();
+        } else if (activeStreamBlockKind === 'tool_use') {
+          finalizeToolUse();
+        } else {
+          finalizeAssistant();
+        }
+        activeStreamBlockKind = null;
+        continue;
+      }
+      if (ev.type === 'message_stop') {
+        finalizeThinking();
+        finalizeToolUse();
         finalizeAssistant();
+        activeStreamBlockKind = null;
         continue;
       }
     }
 
     if (action.type === 'assistant') {
       if (hasStreamEvent) continue;
+      const blocks = getAssistantContentBlocks(action);
+      if (blocks.length) {
+        const stamp = action.timestamp || nowIso();
+        let sawBlock = false;
+        for (const block of blocks) {
+          if (!block || typeof block !== 'object') continue;
+          if (block.type === 'thinking') {
+            const text = typeof block.thinking === 'string'
+              ? block.thinking
+              : (typeof block.text === 'string' ? block.text : extractTextValue(block.content));
+            if (text) {
+              finalizeAssistant();
+              pushMessage({
+                id: `thinking-${messages.length}-${Date.now()}`,
+                role: 'assistant',
+                kind: 'thinking',
+                content: text,
+                timestamp: stamp,
+                pending: false,
+              });
+              sawBlock = true;
+            }
+            continue;
+          }
+          if (block.type === 'tool_use') {
+            finalizeAssistant();
+            finalizeThinking();
+            const toolContent = {
+              name: block.name || 'tool',
+              input: block.input && typeof block.input === 'object' ? block.input : {},
+            };
+            pushMessage({
+              id: `tool-${messages.length}-${Date.now()}`,
+              role: 'tool',
+              kind: 'tool_use',
+              tool_name: block.name || 'tool',
+              content: JSON.stringify(toolContent, null, 2),
+              timestamp: stamp,
+              pending: false,
+            });
+            sawBlock = true;
+            continue;
+          }
+          if (block.type === 'text' && typeof block.text === 'string') {
+            appendAssistantText(block.text, stamp);
+            sawBlock = true;
+          }
+        }
+        if (sawBlock) continue;
+      }
       const text = actionText(action);
       if (text) appendAssistantText(text, action.timestamp || nowIso());
       continue;
@@ -331,4 +520,6 @@ export {
   normalizeTimestamp,
   parseWsPayload,
   reduceTranscriptActions,
+  getAssistantContentBlocks,
+  extractThinkingText,
 };

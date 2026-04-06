@@ -2,6 +2,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { render, Box, Text, useApp, useInput } from 'ink';
 import { createRemoteSessionClient } from '../runtime/remote-session.js';
+import { captureClipboardImage } from '../runtime/clipboard-image.js';
+import { formatAttachmentChip, normalizeAttachments } from '../shared/attachments.js';
 
 function isUuid(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -51,8 +53,46 @@ async function listSessions(baseUrl = '') {
 
 function MessageLine({ message }) {
   const role = message.role || 'system';
-  const color = role === 'user' ? 'green' : role === 'assistant' ? 'white' : role === 'error' ? 'red' : 'gray';
-  const lines = String(message.content || '').trim().split('\n');
+  const color = message.kind === 'thinking'
+    ? 'gray'
+    : (message.kind === 'tool_use'
+      ? 'cyan'
+      : (role === 'user' ? 'green' : role === 'assistant' ? 'white' : role === 'error' ? 'red' : 'gray'));
+  const raw = String(message.content || '').trim();
+  const lines = raw ? raw.split('\n') : [''];
+  const toolPayload = (() => {
+    if (message.kind !== 'tool_use' || !raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  })();
+  const toolName = String(message.tool_name || toolPayload?.name || 'tool').trim() || 'tool';
+  const toolInput = toolPayload && typeof toolPayload.input === 'object'
+    ? toolPayload.input
+    : (toolPayload && typeof toolPayload === 'object' ? toolPayload : {});
+  const toolDisplayInput = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  const toolLine = (() => {
+    if (message.kind !== 'tool_use') return lines[0] || '<empty>';
+    if (!toolPayload) return lines[0] || '<empty>';
+    if (toolName.toLowerCase() === 'read') {
+      return `tool use: Read ${toolDisplayInput.file_path || toolDisplayInput.path || '<unknown>'}`;
+    }
+    if (toolName.toLowerCase() === 'bash' && typeof toolDisplayInput.command === 'string') {
+      return `tool use: bash ${toolDisplayInput.command}`;
+    }
+    if (toolName.toLowerCase() === 'search') {
+      const query = toolDisplayInput.query || toolDisplayInput.search || '';
+      return `tool use: search ${query}`;
+    }
+    return `tool use: ${toolName}`;
+  })();
+  const headText = message.kind === 'thinking'
+    ? `thinking: ${lines[0] || '<empty>'}`
+    : (message.kind === 'tool_use'
+      ? toolLine
+      : (lines[0] || '<empty>'));
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box>
@@ -61,27 +101,53 @@ function MessageLine({ message }) {
         </Text>
         {message.pending ? <Text color="yellow"> •</Text> : null}
         <Text> </Text>
-        <Text>{lines[0] || '<empty>'}</Text>
+        <Text dimColor={message.kind === 'thinking'}>{headText}</Text>
       </Box>
+      {message.kind === 'tool_use' && toolPayload ? (
+        <Box>
+          <Text dimColor>  </Text>
+          <Text dimColor>{JSON.stringify(toolDisplayInput, null, 2)}</Text>
+        </Box>
+      ) : null}
       {lines.slice(1).map((line, idx) => (
         <Box key={`${message.id}-${idx}`}>
           <Text dimColor>  </Text>
-          <Text>{line}</Text>
+          <Text dimColor={message.kind === 'thinking'}>{line}</Text>
         </Box>
       ))}
     </Box>
   );
 }
 
-function InputController({ value, setValue, onSubmit, onExit }) {
+function AttachmentLine({ attachments }) {
+  const items = normalizeAttachments(attachments || []);
+  if (!items.length) return null;
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      {items.map((attachment, idx) => (
+        <Box key={attachment.id || `${attachment.filename}-${idx}`}>
+          <Text color="cyan">{formatAttachmentChip(idx + 1, attachment)}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+function InputController({ value, setValue, onSubmit, onExit, onImagePaste, canSubmitEmpty = false }) {
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === 'c') {
       onExit();
       return;
     }
+    if (key.ctrl && inputChar === 'v') {
+      if (onImagePaste) {
+        void onImagePaste();
+      }
+      return;
+    }
     if (key.return) {
       const next = value.trim();
-      if (!next) return;
+      if (!next && !canSubmitEmpty) return;
       setValue('');
       onSubmit(next);
       return;
@@ -107,11 +173,17 @@ function SessionTui({ sessionId, baseUrl = '' }) {
   const client = useMemo(() => createRemoteSessionClient({ apiBase: baseUrl, sessionId }), [baseUrl, sessionId]);
   const [state, setState] = useState(client.getState());
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState([]);
   const [exitArmed, setExitArmed] = useState(false);
   const exitTimer = React.useRef(null);
   const inputEnabled = !!process.stdin.isTTY && !!process.stdout.isTTY;
 
   useEffect(() => client.subscribe(setState), [client]);
+
+  useEffect(() => {
+    setInput('');
+    setAttachments([]);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!exitArmed) return undefined;
@@ -132,6 +204,64 @@ function SessionTui({ sessionId, baseUrl = '' }) {
     return () => client.disconnect();
   }, [client]);
 
+  const handleSubmit = async (text) => {
+    const trimmed = String(text || '').trim();
+    if (/^\/attach\s+/i.test(trimmed)) {
+      const paths = trimmed.replace(/^\/attach\s+/i, '').trim().split(/\s+/).filter(Boolean);
+      if (!paths.length) return;
+      for (const filePath of paths) {
+        try {
+          const uploaded = await client.uploadLocalAttachment(filePath);
+          if (uploaded) {
+            setAttachments((prev) => prev.concat([{
+              id: uploaded.id,
+              filename: uploaded.filename,
+              mimeType: uploaded.mime_type,
+              serverPath: uploaded.server_path,
+              size: uploaded.size,
+            }]));
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(err);
+        }
+      }
+      return;
+    }
+    if (!trimmed && !attachments.length) return;
+    const ok = await client.sendTurn({ text: trimmed, attachments });
+    if (ok !== false) {
+      setInput('');
+      setAttachments([]);
+    }
+  };
+
+  const handleClipboardImagePaste = async () => {
+    const clip = await captureClipboardImage();
+    if (!clip) {
+      return;
+    }
+    try {
+      const uploaded = await client.uploadLocalAttachment(clip.path, clip.mimeType);
+      if (uploaded) {
+        setAttachments((prev) => prev.concat([{
+          id: uploaded.id,
+          filename: uploaded.filename,
+          mimeType: uploaded.mime_type,
+          serverPath: uploaded.server_path,
+          size: uploaded.size,
+        }]));
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(err);
+    } finally {
+      if (clip.cleanup) {
+        await clip.cleanup().catch(() => {});
+      }
+    }
+  };
+
   const session = client.getCurrentSummary() || { id: sessionId };
   const messages = state.messages || [];
   const queue = state.queue || [];
@@ -147,7 +277,9 @@ function SessionTui({ sessionId, baseUrl = '' }) {
         <InputController
           value={input}
           setValue={setInput}
-          onSubmit={(text) => client.sendTurn(text).catch(() => {})}
+          onSubmit={(text) => handleSubmit(text)}
+          onImagePaste={() => handleClipboardImagePaste()}
+          canSubmitEmpty={attachments.length > 0}
           onExit={() => {
             if (exitArmed) {
               exit();
@@ -166,6 +298,7 @@ function SessionTui({ sessionId, baseUrl = '' }) {
       </Box>
       <Box flexDirection="column" marginTop={0}>
         <Text dimColor>{rule}</Text>
+        <AttachmentLine attachments={attachments} />
         <Box>
           <Text color="green">&gt; </Text>
           <Text>{promptText}</Text>

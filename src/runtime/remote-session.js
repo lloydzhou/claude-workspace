@@ -8,6 +8,13 @@ import {
   actionText,
 } from '../shared/stream.js';
 
+import {
+  formatAttachmentChip,
+  normalizeAttachments,
+} from '../shared/attachments.js';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 function createStore(initial) {
   let state = { ...initial };
   const listeners = new Set();
@@ -268,11 +275,15 @@ function createRemoteSessionClient({ apiBase = '', sessionId = null } = {}) {
 
   const setQueue = (queue) => setState({ queue });
 
-  const enqueue = (text) => {
+  const enqueue = (turn) => {
     const next = getQueue().slice();
-    next.push(text);
+    const text = typeof turn === 'string' ? turn : String(turn?.text || turn?.content || '');
+    next.push({
+      text,
+      attachments: normalizeAttachments(turn?.attachments || []),
+    });
     setQueue(next);
-    pushConsole({ kind: 'queue', source: 'cli', title: 'queued input', data: text, timestamp: nowIso() });
+    pushConsole({ kind: 'queue', source: 'cli', title: 'queued input', data: next[next.length - 1], timestamp: nowIso() });
   };
 
   const dequeue = () => {
@@ -285,20 +296,56 @@ function createRemoteSessionClient({ apiBase = '', sessionId = null } = {}) {
     return item;
   };
 
+  const uploadLocalAttachment = async (filePath, mimeTypeOverride = '') => {
+    if (!sessionId || !filePath) return null;
+    const data = await readFile(filePath);
+    const filename = path.basename(filePath);
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    const mimeTypeByExt = {
+      png: 'image/png',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      gif: 'image/gif',
+      webp: 'image/webp',
+      bmp: 'image/bmp',
+      svg: 'image/svg+xml',
+    };
+    const mimeType = mimeTypeOverride || mimeTypeByExt[ext] || 'application/octet-stream';
+    const res = await api(`/api/sessions/${sessionId}/uploads`, {
+      method: 'POST',
+      headers: {
+        'X-Filename': filename,
+        'Content-Type': mimeType,
+      },
+      body: data,
+    });
+    return res.uploaded;
+  };
+
   const flushQueue = async () => {
     if (!sessionId || !getQueue().length || isBusy() || isSending()) return;
     const next = dequeue();
     if (next) await sendTurn(next);
   };
 
-  const sendTurn = async (text) => {
+  const sendTurn = async (turn) => {
     if (!sessionId) return false;
     if (isSending()) return false;
-    const clean = String(text || '').trim();
-    if (!clean) return false;
+    const draft = typeof turn === 'string'
+      ? { text: String(turn || '').trim(), attachments: [] }
+      : {
+          text: String(turn?.text || turn?.content || '').trim(),
+          attachments: normalizeAttachments(turn?.attachments || []),
+        };
+    const clean = draft.text;
+    if (!clean && !draft.attachments.length) return false;
     setSending(true);
     try {
-      const msg = { type: 'turn_request', content: clean };
+      const msg = {
+        type: 'turn_request',
+        content: clean,
+        attachments: draft.attachments.map((attachment) => attachment.serverPath).filter(Boolean),
+      };
       pushConsole({ kind: 'request', source: 'cli', title: 'turn request', data: msg, timestamp: nowIso() });
       await api(`/api/sessions/${sessionId}/turn`, { method: 'POST', body: JSON.stringify(msg) });
       setSessionPatch({ status: 'running', locked: true });
@@ -306,11 +353,11 @@ function createRemoteSessionClient({ apiBase = '', sessionId = null } = {}) {
       return true;
     } catch (err) {
       if (err.status === 409) {
-        enqueue(clean);
-        pushConsole({ kind: 'queue', source: 'cli', title: 'busy -> queue', data: { text: clean, status: err.status, message: err.message }, timestamp: nowIso() });
-        return false;
+        enqueue(draft);
+        pushConsole({ kind: 'queue', source: 'cli', title: 'busy -> queue', data: { text: clean, attachments: draft.attachments, status: err.status, message: err.message }, timestamp: nowIso() });
+        return true;
       }
-      pushConsole({ kind: 'error', source: 'cli', title: 'turn failed', data: { text: clean, status: err.status, message: err.message }, timestamp: nowIso() });
+      pushConsole({ kind: 'error', source: 'cli', title: 'turn failed', data: { text: clean, attachments: draft.attachments, status: err.status, message: err.message }, timestamp: nowIso() });
       return false;
     } finally {
       setSending(false);
@@ -358,6 +405,7 @@ function createRemoteSessionClient({ apiBase = '', sessionId = null } = {}) {
     disconnect,
     loadSession,
     sendTurn,
+    uploadLocalAttachment,
     flushQueue,
     getMessages,
     getConsole,

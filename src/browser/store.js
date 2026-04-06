@@ -1,5 +1,9 @@
 import { marked } from 'marked';
 import hljs from 'highlight.js';
+import {
+  formatAttachmentChip,
+  normalizeAttachments,
+} from '../shared/attachments.js';
 
 function createStore(initial) {
   let state = { ...initial };
@@ -124,6 +128,31 @@ function getConsoleEntries(sessionId) {
 
 function getQueue(sessionId) {
   return store.get().queueBySession[sessionId] || [];
+}
+
+function normalizeTurnDraft(input, attachments = []) {
+  const text = typeof input === 'string' ? input : String(input?.text || input?.content || '');
+  const normalizedAttachments = normalizeAttachments(attachments);
+  return {
+    text,
+    attachments: normalizedAttachments,
+  };
+}
+
+function formatTurnSummary(turn) {
+  if (!turn) return '';
+  const draft = typeof turn === 'string'
+    ? normalizeTurnDraft(turn)
+    : normalizeTurnDraft(turn.text || turn.content || '', turn.attachments || []);
+  const parts = [];
+  const text = String(draft.text || '').trim();
+  if (text) {
+    parts.push(text.length > 120 ? `${text.slice(0, 120)}…` : text);
+  }
+  if (draft.attachments.length) {
+    parts.push(draft.attachments.map((attachment, idx) => formatAttachmentChip(idx + 1, attachment)).join('  '));
+  }
+  return parts.join('\n');
 }
 
 function getLastMessageId(sessionId) {
@@ -347,6 +376,33 @@ function extractTextValue(value) {
   return '';
 }
 
+function getAssistantContentBlocks(action) {
+  if (!action || typeof action !== 'object') return [];
+  const candidates = [
+    action.content,
+    action.raw && action.raw.content,
+    action.message && action.message.content,
+    action.raw && action.raw.message && action.raw.message.content,
+  ];
+  for (const blocks of candidates) {
+    if (Array.isArray(blocks) && blocks.length) return blocks;
+  }
+  return [];
+}
+
+function extractThinkingText(action) {
+  const blocks = getAssistantContentBlocks(action);
+  const parts = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object' || block.type !== 'thinking') continue;
+    const text = typeof block.thinking === 'string'
+      ? block.thinking
+      : (typeof block.text === 'string' ? block.text : extractTextValue(block.content));
+    if (text) parts.push(text);
+  }
+  return parts.join('\n\n');
+}
+
 function normalizeAction(payload, source = 'remote') {
   if (!payload || typeof payload !== 'object') {
     return {
@@ -379,9 +435,10 @@ function actionText(action) {
     return '';
   }
   // Handle assistant messages with content blocks (tool_use, text, thinking, etc)
-  if (action.type === 'assistant' && Array.isArray(action.content)) {
+  if (action.type === 'assistant') {
+    const blocks = getAssistantContentBlocks(action);
     const textParts = [];
-    for (const block of action.content) {
+    for (const block of blocks) {
       if (block.type === 'text' && typeof block.text === 'string') {
         textParts.push(block.text);
       }
@@ -494,6 +551,9 @@ function reduceTranscriptActions(actions) {
 
   const messages = [];
   let assistantDraft = null;
+  let thinkingDraft = null;
+  let toolDraft = null;
+  let activeStreamBlockKind = null;
   const hasStreamEvent = actions.some((action) => !!extractStreamEvent(action));
 
   const pushMessage = (message) => {
@@ -521,6 +581,74 @@ function reduceTranscriptActions(actions) {
     assistant.content += text;
     assistant.timestamp = timestamp || assistant.timestamp || nowIso();
     assistant.pending = true;
+  };
+
+  const startThinking = (timestamp) => {
+    if (thinkingDraft) return thinkingDraft;
+    finalizeAssistant();
+    thinkingDraft = pushMessage({
+      id: `thinking-${messages.length}-${Date.now()}`,
+      role: 'assistant',
+      kind: 'thinking',
+      content: '',
+      timestamp: timestamp || nowIso(),
+      pending: true,
+    });
+    return thinkingDraft;
+  };
+
+  const appendThinkingText = (text, timestamp) => {
+    if (!text) return;
+    const thinking = startThinking(timestamp);
+    thinking.content += text;
+    thinking.timestamp = timestamp || thinking.timestamp || nowIso();
+    thinking.pending = true;
+  };
+
+  const startToolUse = (timestamp, toolBlock = null) => {
+    if (toolDraft) return toolDraft;
+    finalizeAssistant();
+    finalizeThinking();
+    toolDraft = pushMessage({
+      id: `tool-${messages.length}-${Date.now()}`,
+      role: 'tool',
+      kind: 'tool_use',
+      tool_name: toolBlock && toolBlock.name ? toolBlock.name : '',
+      content: '',
+      timestamp: timestamp || nowIso(),
+      pending: true,
+    });
+    return toolDraft;
+  };
+
+  const appendToolInput = (text, timestamp) => {
+    if (!text) return;
+    const tool = startToolUse(timestamp);
+    tool.content += text;
+    tool.timestamp = timestamp || tool.timestamp || nowIso();
+    tool.pending = true;
+  };
+
+  const finalizeToolUse = () => {
+    if (toolDraft) {
+      if (!String(toolDraft.content || '').trim()) {
+        messages.pop();
+      } else {
+        toolDraft.pending = false;
+      }
+      toolDraft = null;
+    }
+  };
+
+  const finalizeThinking = () => {
+    if (thinkingDraft) {
+      if (!String(thinkingDraft.content || '').trim()) {
+        messages.pop();
+      } else {
+        thinkingDraft.pending = false;
+      }
+      thinkingDraft = null;
+    }
   };
 
   const finalizeAssistant = () => {
@@ -558,7 +686,25 @@ function reduceTranscriptActions(actions) {
     if (ev) {
       const stamp = action.timestamp || nowIso();
 
+      if (ev.type === 'content_block_start' && ev.content_block) {
+        activeStreamBlockKind = ev.content_block.type || null;
+        if (activeStreamBlockKind === 'thinking') {
+          startThinking(stamp);
+        } else if (activeStreamBlockKind === 'tool_use') {
+          startToolUse(stamp, ev.content_block);
+        }
+        continue;
+      }
+
       if (ev.type === 'content_block_delta' && ev.delta) {
+        if (ev.delta.type === 'thinking_delta' || typeof ev.delta.thinking === 'string') {
+          appendThinkingText(ev.delta.thinking || ev.delta.text || '', stamp);
+          continue;
+        }
+        if (ev.delta.type === 'input_json_delta' || typeof ev.delta.partial_json === 'string') {
+          appendToolInput(ev.delta.partial_json || ev.delta.text || '', stamp);
+          continue;
+        }
         if (typeof ev.delta.text === 'string') {
           appendAssistantText(ev.delta.text, stamp);
           continue;
@@ -570,6 +716,14 @@ function reduceTranscriptActions(actions) {
       }
 
       if (ev.type === 'message_delta' && ev.delta) {
+        if (ev.delta.type === 'thinking_delta' || typeof ev.delta.thinking === 'string') {
+          appendThinkingText(ev.delta.thinking || ev.delta.text || '', stamp);
+          continue;
+        }
+        if (ev.delta.type === 'input_json_delta' || typeof ev.delta.partial_json === 'string') {
+          appendToolInput(ev.delta.partial_json || ev.delta.text || '', stamp);
+          continue;
+        }
         if (typeof ev.delta.text === 'string') {
           appendAssistantText(ev.delta.text, stamp);
         }
@@ -581,8 +735,23 @@ function reduceTranscriptActions(actions) {
         continue;
       }
 
-      if (ev.type === 'content_block_stop' || ev.type === 'message_stop') {
+      if (ev.type === 'content_block_stop') {
+        if (activeStreamBlockKind === 'thinking') {
+          finalizeThinking();
+        } else if (activeStreamBlockKind === 'tool_use') {
+          finalizeToolUse();
+        } else {
+          finalizeAssistant();
+        }
+        activeStreamBlockKind = null;
+        continue;
+      }
+
+      if (ev.type === 'message_stop') {
+        finalizeThinking();
+        finalizeToolUse();
         finalizeAssistant();
+        activeStreamBlockKind = null;
         continue;
       }
     }
@@ -590,6 +759,58 @@ function reduceTranscriptActions(actions) {
     if (action.type === 'assistant') {
       if (hasStreamEvent) {
         continue;
+      }
+      const blocks = getAssistantContentBlocks(action);
+      if (blocks.length) {
+        const stamp = action.timestamp || nowIso();
+        let sawBlock = false;
+        for (const block of blocks) {
+          if (!block || typeof block !== 'object') continue;
+          if (block.type === 'thinking') {
+            const text = typeof block.thinking === 'string'
+              ? block.thinking
+              : (typeof block.text === 'string' ? block.text : extractTextValue(block.content));
+            if (text) {
+              finalizeAssistant();
+              pushMessage({
+                id: `thinking-${messages.length}-${Date.now()}`,
+                role: 'assistant',
+                kind: 'thinking',
+                content: text,
+                timestamp: stamp,
+                pending: false,
+              });
+              sawBlock = true;
+            }
+            continue;
+          }
+          if (block.type === 'tool_use') {
+            finalizeAssistant();
+            finalizeThinking();
+            const toolContent = {
+              name: block.name || 'tool',
+              input: block.input && typeof block.input === 'object' ? block.input : {},
+            };
+            pushMessage({
+              id: `tool-${messages.length}-${Date.now()}`,
+              role: 'tool',
+              kind: 'tool_use',
+              tool_name: block.name || 'tool',
+              content: JSON.stringify(toolContent, null, 2),
+              timestamp: stamp,
+              pending: false,
+            });
+            sawBlock = true;
+            continue;
+          }
+          if (block.type === 'text' && typeof block.text === 'string') {
+            appendAssistantText(block.text, stamp);
+            sawBlock = true;
+          }
+        }
+        if (sawBlock) {
+          continue;
+        }
       }
       const text = actionText(action);
       if (text) {
@@ -741,17 +962,17 @@ function replaceActions(sessionId, nextActions) {
   recomputeMessages(sessionId);
 }
 
-function enqueue(sessionId, text) {
+function enqueue(sessionId, turn) {
   const queueBySession = cloneMap(store.get().queueBySession);
   const next = getQueue(sessionId).slice();
-  next.push(text);
+  next.push(normalizeTurnDraft(turn?.text || turn?.content || turn || '', turn?.attachments || []));
   queueBySession[sessionId] = next;
   store.set({ queueBySession });
   pushConsole(sessionId, {
     kind: 'queue',
     source: 'ui',
     title: 'queued input',
-    data: text,
+    data: next[next.length - 1],
   });
 }
 
@@ -770,6 +991,31 @@ function dequeue(sessionId) {
     });
   }
   return item;
+}
+
+async function uploadAttachment(sessionId, file) {
+  if (!sessionId || !file) {
+    return null;
+  }
+  const body = file instanceof Blob ? file : new Blob([file]);
+  const filename = file.name || file.filename || 'attachment';
+  const mimeType = file.type || file.mimeType || 'application/octet-stream';
+  const res = await fetch(`/api/sessions/${sessionId}/uploads`, {
+    method: 'POST',
+    headers: {
+      'X-Filename': filename,
+      'Content-Type': mimeType,
+    },
+    body,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data && data.error ? data.error : res.statusText;
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return data.uploaded;
 }
 
 function setSessionStatus(sessionId, patch) {
@@ -844,13 +1090,22 @@ function highlightCodeBlocks(container) {
 
 function detectToolType(obj) {
   if (!obj || typeof obj !== 'object') return null;
-  if (obj.command !== undefined) return 'bash';
-  if ((obj.file_path || obj.path) && (obj.content !== undefined || obj.new_string !== undefined)) return 'write';
-  if ((obj.file_path || obj.path) && (obj.old_string !== undefined)) return 'edit';
-  if (obj.pattern !== undefined && (obj.glob !== undefined)) return 'glob';
-  if (obj.pattern !== undefined) return 'grep';
-  if ((obj.file_path || obj.path) && !obj.content && !obj.old_string && !obj.new_string) return 'read';
-  if (obj.query !== undefined || obj.search !== undefined) return 'search';
+  const input = obj.input && typeof obj.input === 'object' ? obj.input : obj;
+  const toolName = String(obj.name || '').toLowerCase();
+  if (toolName === 'read') return 'read';
+  if (toolName === 'bash') return 'bash';
+  if (toolName === 'write') return 'write';
+  if (toolName === 'edit') return 'edit';
+  if (toolName === 'glob') return 'glob';
+  if (toolName === 'grep') return 'grep';
+  if (toolName === 'search') return 'search';
+  if (input.command !== undefined) return 'bash';
+  if ((input.file_path || input.path) && (input.content !== undefined || input.new_string !== undefined)) return 'write';
+  if ((input.file_path || input.path) && (input.old_string !== undefined)) return 'edit';
+  if (input.pattern !== undefined && (input.glob !== undefined)) return 'glob';
+  if (input.pattern !== undefined) return 'grep';
+  if ((input.file_path || input.path) && !input.content && !input.old_string && !input.new_string) return 'read';
+  if (input.query !== undefined || input.search !== undefined) return 'search';
   return null;
 }
 
@@ -867,75 +1122,76 @@ function renderToolBody(body) {
   try {
     const obj = JSON.parse(body);
     const toolType = detectToolType(obj);
+    const input = obj.input && typeof obj.input === 'object' ? obj.input : obj;
     const lines = [];
     const extraFields = [];
 
     switch (toolType) {
       case 'bash': {
-        lines.push(`<code>${escapeHtml(truncateStr(obj.command, 160))}</code>`);
-        if (obj.description) {
-          lines.push(`<span class="tool-label">desc</span> ${escapeHtml(truncateStr(obj.description, 120))}`);
+        lines.push(`<code>${escapeHtml(truncateStr(input.command, 160))}</code>`);
+        if (input.description) {
+          lines.push(`<span class="tool-label">desc</span> ${escapeHtml(truncateStr(input.description, 120))}`);
         }
-        const extra = Object.entries(obj).filter(([k]) => !['command','description'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['command','description'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'write': {
-        const filePath = obj.file_path || obj.path || '';
-        const content = obj.content || obj.new_string || '';
+        const filePath = input.file_path || input.path || '';
+        const content = input.content || input.new_string || '';
         const lineCount = content.split('\n').length;
         lines.push(`<code>${escapeHtml(truncateStr(filePath, 120))}</code> <span class="tool-label">${lineCount} line${lineCount !== 1 ? 's' : ''}</span>`);
-        const extra = Object.entries(obj).filter(([k]) => !['file_path','path','content','new_string'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['file_path','path','content','new_string'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'edit': {
-        const filePath = obj.file_path || obj.path || '';
+        const filePath = input.file_path || input.path || '';
         lines.push(`<code>${escapeHtml(truncateStr(filePath, 120))}</code>`);
-        if (obj.old_string) {
-          lines.push(`<span class="tool-label">old</span> <code>${escapeHtml(truncateStr(obj.old_string, 80))}</code>`);
+        if (input.old_string) {
+          lines.push(`<span class="tool-label">old</span> <code>${escapeHtml(truncateStr(input.old_string, 80))}</code>`);
         }
-        if (obj.new_string) {
-          lines.push(`<span class="tool-label">new</span> <code>${escapeHtml(truncateStr(obj.new_string, 80))}</code>`);
+        if (input.new_string) {
+          lines.push(`<span class="tool-label">new</span> <code>${escapeHtml(truncateStr(input.new_string, 80))}</code>`);
         }
-        const extra = Object.entries(obj).filter(([k]) => !['file_path','path','old_string','new_string','replace_all'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['file_path','path','old_string','new_string','replace_all'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'read': {
-        const filePath = obj.file_path || obj.path || '';
+        const filePath = input.file_path || input.path || '';
         lines.push(`<code>${escapeHtml(truncateStr(filePath, 120))}</code>`);
-        const extra = Object.entries(obj).filter(([k]) => !['file_path','path','offset','limit'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['file_path','path','offset','limit'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'glob': {
-        lines.push(`<span class="tool-label">pattern</span> <code>${escapeHtml(truncateStr(obj.pattern, 80))}</code>`);
-        if (obj.path) {
-          lines.push(`<span class="tool-label">path</span> <code>${escapeHtml(truncateStr(obj.path, 80))}</code>`);
+        lines.push(`<span class="tool-label">pattern</span> <code>${escapeHtml(truncateStr(input.pattern, 80))}</code>`);
+        if (input.path) {
+          lines.push(`<span class="tool-label">path</span> <code>${escapeHtml(truncateStr(input.path, 80))}</code>`);
         }
-        const extra = Object.entries(obj).filter(([k]) => !['pattern','path','glob'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['pattern','path','glob'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'grep': {
-        lines.push(`<span class="tool-label">pattern</span> <code>${escapeHtml(truncateStr(obj.pattern, 80))}</code>`);
-        if (obj.path) {
-          lines.push(`<span class="tool-label">path</span> <code>${escapeHtml(truncateStr(obj.path, 80))}</code>`);
+        lines.push(`<span class="tool-label">pattern</span> <code>${escapeHtml(truncateStr(input.pattern, 80))}</code>`);
+        if (input.path) {
+          lines.push(`<span class="tool-label">path</span> <code>${escapeHtml(truncateStr(input.path, 80))}</code>`);
         }
-        const extra = Object.entries(obj).filter(([k]) => !['pattern','path','output_mode','glob','type','context','head_limit','offset','-i'].includes(k));
+        const extra = Object.entries(input).filter(([k]) => !['pattern','path','output_mode','glob','type','context','head_limit','offset','-i'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       case 'search': {
-        lines.push(`<code>${escapeHtml(truncateStr(obj.query || obj.search, 120))}</code>`);
-        const extra = Object.entries(obj).filter(([k]) => !['query','search'].includes(k));
+        lines.push(`<code>${escapeHtml(truncateStr(input.query || input.search, 120))}</code>`);
+        const extra = Object.entries(input).filter(([k]) => !['query','search'].includes(k));
         if (extra.length) extraFields.push(...extra);
         break;
       }
       default: {
         const parts = [];
-        for (const [key, val] of Object.entries(obj)) {
+        for (const [key, val] of Object.entries(input)) {
           parts.push(`<span class="tool-label">${escapeHtml(key)}</span> ${escapeHtml(truncateStr(typeof val === 'string' ? val : JSON.stringify(val), 120))}`);
         }
         if (parts.length) {
@@ -1242,10 +1498,12 @@ function connectWS(sessionId, opts = {}) {
   };
 }
 
-async function dispatchTurn(sessionId, text) {
+async function dispatchTurn(sessionId, turn) {
+  const draft = normalizeTurnDraft(turn?.text || turn?.content || turn || '', turn?.attachments || []);
   const msg = {
     type: 'turn_request',
-    content: text,
+    content: draft.text,
+    attachments: draft.attachments.map((attachment) => attachment.serverPath).filter(Boolean),
   };
 
   if (isSending(sessionId)) {
@@ -1269,12 +1527,12 @@ async function dispatchTurn(sessionId, text) {
     return true;
   } catch (err) {
     if (err.status === 409) {
-      enqueue(sessionId, text);
+      enqueue(sessionId, draft);
       pushConsole(sessionId, {
         kind: 'queue',
         source: 'browser',
         title: 'busy -> queue',
-        data: { text, status: err.status, message: err.message },
+        data: { text: draft.text, attachments: draft.attachments, status: err.status, message: err.message },
       });
       return false;
     }
@@ -1282,7 +1540,7 @@ async function dispatchTurn(sessionId, text) {
       kind: 'error',
       source: 'browser',
       title: 'turn failed',
-      data: { text, status: err.status, message: err.message },
+      data: { text: draft.text, attachments: draft.attachments, status: err.status, message: err.message },
     });
     return false;
   } finally {
@@ -1298,26 +1556,27 @@ function flushQueue(sessionId) {
   dispatchTurn(sessionId, next);
 }
 
-function sendCurrentInput(explicitText) {
+function sendCurrentInput(explicitText, explicitAttachments = []) {
   const sid = store.get().currentSession;
   if (!sid) return;
   if (isSending(sid)) return;
   if (typeof explicitText !== 'string') return false;
   const text = explicitText.trim();
-  if (!text) return;
+  const turn = { text, attachments: normalizeAttachments(explicitAttachments) };
+  if (!turn.text && !turn.attachments.length) return;
 
   pushConsole(sid, {
     kind: 'input',
     source: 'browser',
     title: 'local input',
-    data: text,
+    data: turn,
     timestamp: nowIso(),
   });
   if (isBusy(sid)) {
-    enqueue(sid, text);
+    enqueue(sid, turn);
     return true;
   }
-  dispatchTurn(sid, text);
+  dispatchTurn(sid, turn);
   return true;
 }
 
@@ -1359,8 +1618,11 @@ if (typeof window !== 'undefined') {
     clearConsole,
     clearLogs,
     sendCurrentInput,
+    uploadAttachment,
     scrollTranscriptToLatest,
     setTranscriptAutoFollow,
+    formatTurnSummary,
+    normalizeTurnDraft,
   };
   window.dispatchEvent(new CustomEvent('claude-workspace:ready'));
 }
