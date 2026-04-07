@@ -16,11 +16,13 @@ services:
       timeout: 3s
       retries: 20
 
-  claude-workspace:
+  claude-hub:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: claude-workspace
+      args:
+        GITHUB_PROXY: ${GITHUB_PROXY:-}
+    container_name: claude-hub
     ports:
       - "8080:8080"
     depends_on:

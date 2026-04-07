@@ -14,7 +14,7 @@ function createStore(initial) {
     state = { ...state, ...updates };
     listeners.forEach((fn) => fn(state));
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('claude-workspace:statechange'));
+      window.dispatchEvent(new CustomEvent('claude-hub:statechange'));
     }
   },
     subscribe: (fn) => {
@@ -63,7 +63,7 @@ function cloneMap(map) {
   return { ...(map || {}) };
 }
 
-const CURRENT_SESSION_KEY = 'claude-cluster.current-session';
+const CURRENT_SESSION_KEY = 'claude-hub.current-session';
 const WS_REPLAY_WINDOW_MS = 180;
 const wsReplayBuffers = new Map();
 const wsReplayTimers = new Map();
@@ -1591,8 +1591,8 @@ function sendCurrentInput(explicitText, explicitAttachments = []) {
 })();
 
 if (typeof window !== 'undefined') {
-  window.ClaudeWorkspaceReact = true;
-  window.ClaudeWorkspaceStore = {
+  window.ClaudeHubReact = true;
+  window.ClaudeHubStore = {
     store,
     getCurrentSession,
     getMessages,
@@ -1624,5 +1624,5 @@ if (typeof window !== 'undefined') {
     formatTurnSummary,
     normalizeTurnDraft,
   };
-  window.dispatchEvent(new CustomEvent('claude-workspace:ready'));
+  window.dispatchEvent(new CustomEvent('claude-hub:ready'));
 }

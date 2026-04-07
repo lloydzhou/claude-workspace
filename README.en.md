@@ -1,6 +1,6 @@
-# Claude Workspace
+# Claude Hub
 
-Claude Workspace is a session-based Claude workspace built on OpenResty + Nchan.
+Claude Hub is a session-based Claude workspace built on OpenResty + Nchan.
 
 The current implementation is intentionally CGI-like:
 

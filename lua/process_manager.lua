@@ -558,7 +558,7 @@ function _M.spawn(session_id, body)
     publish_user_event(session_id, body)
 
     local prefix = ngx.config.prefix()
-    local session_dir = os.getenv("CLAUDE_WORKSPACE_DIR") or (prefix .. "projects/" .. session_id)
+    local session_dir = os.getenv("CLAUDE_HUB_DIR") or (prefix .. "projects/" .. session_id)
     os.execute("mkdir -p " .. shell_quote(session_dir))
     local repo_ok, repo_err = ensure_session_repo(session_dir)
     if not repo_ok then

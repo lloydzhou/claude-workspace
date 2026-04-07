@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { render, Box, Text, useApp, useInput } from 'ink';
+import { marked } from 'marked';
 import { createRemoteSessionClient } from '../runtime/remote-session.js';
 import { captureClipboardImage } from '../runtime/clipboard-image.js';
 import { formatAttachmentChip, normalizeAttachments } from '../shared/attachments.js';
@@ -51,6 +52,158 @@ async function listSessions(baseUrl = '') {
   }
 }
 
+function formatElapsed(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+
+function ThinkingMessage({ text }) {
+  try {
+    const tokens = marked.lexer(text);
+    const elements = [];
+    for (const token of tokens) {
+      if (token.type === 'heading') {
+        const prefix = '#'.repeat(Math.min(token.depth, 4)) + ' ';
+        elements.push(
+          <Box key={`h-${elements.length}`}>
+            <Text bold color="white">{prefix}{token.text}</Text>
+          </Box>
+        );
+      } else if (token.type === 'paragraph') {
+        const inlineParts = renderInlineMarkdown(token.text || '', elements.length);
+        elements.push(
+          <Box key={`p-${elements.length}`} marginBottom={1}>
+            {inlineParts}
+          </Box>
+        );
+      } else if (token.type === 'code') {
+        elements.push(
+          <Box key={`cb-${elements.length}`} marginBottom={1}>
+            <Text color="gray">  ┌ {token.text}</Text>
+          </Box>
+        );
+      } else if (token.type === 'codespan') {
+        elements.push(
+          <Text key={`ci-${elements.length}`} color="cyan">{` ${token.text} `}</Text>
+        );
+      } else if (token.type === 'list') {
+        for (let i = 0; i < token.items.length; i++) {
+          const item = token.items[i];
+          const prefix = token.ordered ? `  ${i + 1}. ` : '  • ';
+          const inlineParts = renderInlineMarkdown(item.text || '', elements.length);
+          elements.push(
+            <Box key={`li-${elements.length}`}>
+              <Text dimColor>{prefix}</Text>
+              {inlineParts}
+            </Box>
+          );
+        }
+      } else if (token.type === 'blockquote') {
+        const inlineParts = renderInlineMarkdown(token.text || '', elements.length);
+        elements.push(
+          <Box key={`bq-${elements.length}`}>
+            <Text dimColor>  │ </Text>
+            {inlineParts}
+          </Box>
+        );
+      } else if (token.type === 'space') {
+        // skip whitespace tokens
+      } else if (token.text) {
+        const inlineParts = renderInlineMarkdown(token.text, elements.length);
+        elements.push(
+          <Box key={`t-${elements.length}`}>
+            {inlineParts}
+          </Box>
+        );
+      }
+    }
+    return elements.length ? <>{elements}</> : <Text dimColor>{text}</Text>;
+  } catch {
+    return <Text dimColor>{text}</Text>;
+  }
+}
+
+function renderInlineMarkdown(text, baseKey) {
+  const parts = [];
+  const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`)/g;
+  let lastIndex = 0;
+  let match;
+  let keyIdx = 0;
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(<Text key={`${baseKey}-t-${keyIdx++}`}>{text.slice(lastIndex, match.index)}</Text>);
+    }
+    if (match[2]) {
+      parts.push(<Text key={`${baseKey}-b-${keyIdx++}`} bold>{match[2]}</Text>);
+    } else if (match[3]) {
+      parts.push(<Text key={`${baseKey}-i-${keyIdx++}`} italic>{match[3]}</Text>);
+    } else if (match[4]) {
+      parts.push(<Text key={`${baseKey}-c-${keyIdx++}`} color="cyan">`{match[4]}`</Text>);
+    }
+    lastIndex = regex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push(<Text key={`${baseKey}-e-${keyIdx++}`}>{text.slice(lastIndex)}</Text>);
+  }
+  return parts.length ? <>{parts}</> : <Text dimColor>{text}</Text>;
+}
+
+function WorkingIndicator({ busy, busySince }) {
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const timerRef = useRef(null);
+  const spinRef = useRef(null);
+
+  useEffect(() => {
+    if (!busy) {
+      if (spinRef.current) clearInterval(spinRef.current);
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+    spinRef.current = setInterval(() => {
+      setFrameIdx((prev) => (prev + 1) % SPINNER_FRAMES.length);
+    }, 80);
+    timerRef.current = setInterval(() => {
+      if (busySince) {
+        setElapsed(Math.floor((Date.now() - busySince) / 1000));
+      }
+    }, 1000);
+    return () => {
+      if (spinRef.current) clearInterval(spinRef.current);
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [busy, busySince]);
+
+  if (!busy) return null;
+  return (
+    <Box>
+      <Text color="yellow">{SPINNER_FRAMES[frameIdx]}</Text>
+      <Text> Working (</Text>
+      <Text bold>{formatElapsed(elapsed)}</Text>
+      <Text dimColor> • esc to interrupt)</Text>
+      <Text>)</Text>
+    </Box>
+  );
+}
+
+function WelcomeScreen({ sessionId, baseUrl }) {
+  return (
+    <Box flexDirection="column" paddingX={2}>
+      <Text bold color="blue">  claude-hub</Text>
+      <Text> </Text>
+      <Text>  <Text dimColor>Model:   </Text><Text>remote</Text></Text>
+      <Text>  <Text dimColor>Server:  </Text><Text>{baseUrl}</Text></Text>
+      <Text>  <Text dimColor>Session: </Text><Text>{sessionId.slice(0, 8)}</Text></Text>
+      <Text> </Text>
+      <Text dimColor>  Type a message and press Enter to begin.</Text>
+      <Text dimColor>  Ctrl+C twice to exit.</Text>
+    </Box>
+  );
+}
+
 function MessageLine({ message }) {
   const role = message.role || 'system';
   const color = message.kind === 'thinking'
@@ -88,11 +241,24 @@ function MessageLine({ message }) {
     }
     return `tool use: ${toolName}`;
   })();
-  const headText = message.kind === 'thinking'
-    ? `thinking: ${lines[0] || '<empty>'}`
-    : (message.kind === 'tool_use'
-      ? toolLine
-      : (lines[0] || '<empty>'));
+  if (message.kind === 'thinking') {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box>
+          <Text color="gray">•</Text>
+          {message.pending ? <Text color="yellow"> •</Text> : null}
+          <Text> </Text>
+          <Text dimColor>thinking:</Text>
+        </Box>
+        <Box flexDirection="column" marginLeft={2}>
+          <ThinkingMessage text={raw} />
+        </Box>
+      </Box>
+    );
+  }
+  const headText = message.kind === 'tool_use'
+    ? toolLine
+    : (lines[0] || '<empty>');
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box>
@@ -176,9 +342,15 @@ function SessionTui({ sessionId, baseUrl = '' }) {
   const [attachments, setAttachments] = useState([]);
   const [exitArmed, setExitArmed] = useState(false);
   const exitTimer = React.useRef(null);
+  const busySinceRef = useRef(null);
   const inputEnabled = !!process.stdin.isTTY && !!process.stdout.isTTY;
 
-  useEffect(() => client.subscribe(setState), [client]);
+  useEffect(() => client.subscribe((newState) => {
+    if (newState.busy && !state.busy) {
+      busySinceRef.current = Date.now();
+    }
+    setState(newState);
+  }), [client]);
 
   useEffect(() => {
     setInput('');
@@ -290,12 +462,17 @@ function SessionTui({ sessionId, baseUrl = '' }) {
         />
       ) : null}
       <Box marginBottom={1}>
-        <Text color="yellow">claude_remote</Text>
+        <Text color="yellow">claude-hub</Text>
         <Text dimColor>  {summary}</Text>
       </Box>
       <Box flexDirection="column" marginBottom={1}>
-        {messages.length ? messages.map((m) => <MessageLine key={m.id} message={m} />) : <Text dimColor>• No transcript yet.</Text>}
+        {messages.length ? messages.map((m) => <MessageLine key={m.id} message={m} />) : <WelcomeScreen sessionId={sessionId} baseUrl={baseUrl} />}
       </Box>
+      {state.busy ? (
+        <Box marginBottom={1}>
+          <WorkingIndicator busy={state.busy} busySince={busySinceRef.current} />
+        </Box>
+      ) : null}
       <Box flexDirection="column" marginTop={0}>
         <Text dimColor>{rule}</Text>
         <AttachmentLine attachments={attachments} />
@@ -309,7 +486,7 @@ function SessionTui({ sessionId, baseUrl = '' }) {
           {exitArmed ? 'Press Ctrl+C again to exit.' : 'accept edits on (shift+tab to cycle)'}
         </Text>
       </Box>
-      {!inputEnabled ? (
+      {!inputEnabled? (
         <Text dimColor>
           Raw mode is unavailable in this environment; TUI input is disabled.
         </Text>
@@ -320,24 +497,19 @@ function SessionTui({ sessionId, baseUrl = '' }) {
 
 async function main() {
   const argv = parseArgs(process.argv.slice(2));
-  const baseUrl = argv.baseUrl || process.env.CLAUDE_REMOTE_URL || 'http://127.0.0.1:8080';
+  const baseUrl = argv.baseUrl || process.env.CLAUDE_HUB_URL || 'http://127.0.0.1:8080';
 
   if (argv.help) {
-    process.stdout.write(`claude_remote\n\n`);
+    process.stdout.write(`claude-hub\n\n`);
     process.stdout.write(`Usage:\n`);
-    process.stdout.write(`  claude_remote list\n`);
-    process.stdout.write(`  claude_remote --session-id <id>\n`);
-    process.stdout.write(`  claude_remote --session-id <id> --base-url http://127.0.0.1:8080\n`);
-    return;
-  }
-
-  if (argv.command === 'list') {
-    await listSessions(baseUrl);
+    process.stdout.write(`  claude-hub list\n`);
+    process.stdout.write(`  claude-hub --session-id <id>\n`);
+    process.stdout.write(`  claude-hub --session-id <id> --base-url http://127.0.0.1:8080\n`);
     return;
   }
 
   if (!argv.sessionId) {
-    process.stderr.write('Missing --session-id. Try `claude_remote list` first.\n');
+    process.stderr.write('Missing --session-id. Try `claude-hub list` first.\n');
     process.exitCode = 1;
     return;
   }

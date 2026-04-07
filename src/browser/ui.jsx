@@ -2,17 +2,17 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { formatAttachmentChip } from '../shared/attachments.js';
 
-window.ClaudeWorkspaceReact = true;
+window.ClaudeHubReact = true;
 
-function useWorkspaceSnapshot() {
-  const read = () => (window.ClaudeWorkspaceStore ? window.ClaudeWorkspaceStore.store.get() : null);
+function useHubSnapshot() {
+  const read = () => (window.ClaudeHubStore ? window.ClaudeHubStore.store.get() : null);
   const [snapshot, setSnapshot] = useState(read);
 
   useEffect(() => {
     const sync = () => setSnapshot(read());
     let unsubscribe = null;
     const attach = () => {
-      const api = window.ClaudeWorkspaceStore;
+      const api = window.ClaudeHubStore;
       if (!api || !api.store || typeof api.store.subscribe !== 'function') {
         return false;
       }
@@ -21,7 +21,7 @@ function useWorkspaceSnapshot() {
       return true;
     };
     attach();
-    const poll = window.ClaudeWorkspaceStore ? null : setInterval(() => {
+    const poll = window.ClaudeHubStore ? null : setInterval(() => {
       if (attach()) {
         clearInterval(poll);
       }
@@ -36,8 +36,8 @@ function useWorkspaceSnapshot() {
 }
 
 function helper(name) {
-  return window.ClaudeWorkspaceStore && window.ClaudeWorkspaceStore[name]
-    ? window.ClaudeWorkspaceStore[name]
+  return window.ClaudeHubStore && window.ClaudeHubStore[name]
+    ? window.ClaudeHubStore[name]
     : null;
 }
 
@@ -196,10 +196,15 @@ function TranscriptView({ state }) {
     }
     if (!messages.length) {
       return (
-        <div className="empty-state">
+        <div className="empty-state welcome-banner">
           <div>
-            <h2>Session {formatShortId(sid)}</h2>
-            <p>No transcript yet. Send the first message to start a Claude turn.</p>
+            <h2 className="welcome-title">Claude Hub</h2>
+            <div className="welcome-meta">
+              <div><span className="welcome-label">Session:</span> <span>{formatShortId(sid)}</span></div>
+              <div><span className="welcome-label">Server:</span> <span>{window.location?.origin || baseUrl}</span></div>
+              <div><span className="welcome-label">Model:</span> <span>remote</span></div>
+            </div>
+            <p className="welcome-hint">Send the first message to start a Claude turn.</p>
           </div>
         </div>
       );
@@ -255,7 +260,7 @@ function TranscriptView({ state }) {
 }
 
 function AppShell() {
-  const state = useWorkspaceSnapshot();
+  const state = useHubSnapshot();
   const formatShortId = helper('formatShortId') || ((id) => id ? id.slice(0, 8) : '--------');
   const current = state?.sessions?.find((s) => s.session_id === state.currentSession) || null;
   const connected = !!state?.connected && !!state?.ws;
@@ -416,9 +421,9 @@ function AppShell() {
       <aside className="sidebar" id="sidebar">
         <div className="sidebar-top">
           <div className="brand">
-            <div className="brand-mark">CC</div>
+            <div className="brand-mark">CH</div>
             <div className="brand-copy">
-              <div className="brand-title">Claude Workspace</div>
+              <div className="brand-title">Claude Hub</div>
               <div className="brand-subtitle">Nchan-backed sessions with CGI-like turns</div>
             </div>
           </div>
@@ -457,7 +462,7 @@ function AppShell() {
         </div>
       </aside>
 
-      <main className="workspace">
+      <main className="main-area">
         <header className="topbar">
           <div className="topbar-main">
             <div className="topbar-title" id="topbar-title">{sid ? `Session ${formatShortId(sid)}` : 'No session selected'}</div>

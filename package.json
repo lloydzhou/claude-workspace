@@ -1,5 +1,5 @@
 {
-  "name": "claude-workspace",
+  "name": "claude-hub",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@9.15.4",
@@ -7,6 +7,10 @@
     "build:web": "vite build",
     "dev:web": "vite",
     "cli": "bun src/entrypoints/cli.tsx"
+  },
+  "bin": {
+    "ch": "./src/entrypoints/cli.tsx",
+    "claude-hub": "./src/entrypoints/cli.tsx"
   },
   "devDependencies": {
     "vite": "^6.1.0"

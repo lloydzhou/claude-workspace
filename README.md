@@ -1,6 +1,6 @@
-# Claude Workspace
+# Claude Hub
 
-Claude Workspace 是一个基于 OpenResty + Nchan 的会话式 Claude 工作区。
+Claude Hub 是一个基于 OpenResty + Nchan 的会话式 Claude 工作区。
 
 当前实现采用的是 **CGI-like turn** 模式：
 
@@ -15,7 +15,7 @@ Claude Workspace 是一个基于 OpenResty + Nchan 的会话式 Claude 工作区
 ```mermaid
 flowchart LR
   UI[Browser UI]
-  TUI[claude_remote TUI]
+  TUI[claude-hub TUI]
   subgraph OR[OpenResty server :8080]
     LUA[Lua router]
     NCHAN[Nchan module]
@@ -44,13 +44,13 @@ flowchart LR
 ## 请求流程
 
 1. 浏览器创建或选择一个会话。
-2. 浏览器或 `claude_remote` TUI 保持对 `/sub/:id` 的订阅。
+2. 浏览器或 `claude-hub` TUI 保持对 `/sub/:id` 的订阅。
 3. 用户发送消息时，浏览器或 TUI `POST /api/sessions/:id/turn`。
 4. OpenResty 为该 `session_id` 申请锁。
 5. OpenResty 用 timer 回调启动一次 Claude turn，脱离请求生命周期。
 6. Claude 使用 `stream-json` 输出原始事件。
 7. OpenResty 原样转发这些事件到 Nchan。
-8. 浏览器或 `claude_remote` TUI 从订阅的 session 流里收到原始 `stream-json`。
+8. 浏览器或 `claude-hub` TUI 从订阅的 session 流里收到原始 `stream-json`。
 
 ## 为什么这样设计
 

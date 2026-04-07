@@ -15,7 +15,7 @@ function appleScriptQuote(value) {
 }
 
 async function createTempFile(extension = '.png') {
-  const dir = await mkdtemp(join(os.tmpdir(), 'claude-workspace-clipboard-'));
+  const dir = await mkdtemp(join(os.tmpdir(), 'claude-hub-clipboard-'));
   return join(dir, `clipboard${extension.startsWith('.') ? extension : `.${extension}`}`);
 }
 

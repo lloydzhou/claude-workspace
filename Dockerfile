@@ -24,9 +24,9 @@ COPY src/ /app/src/
 
 RUN pnpm run build:web
 
-FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG}
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS openresty-builder
 
-LABEL maintainer="Claude Workspace"
+LABEL maintainer="Claude Hub"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/home/claude
@@ -60,6 +60,7 @@ ARG RESTY_PCRE_BUILD_OPTIONS="--enable-jit --enable-pcre2grep-jit --disable-bsr-
 ARG RESTY_J="10"
 ARG NCHAN_VERSION="1.3.8"
 ARG DEBIAN_MIRROR="http://mirrors.tuna.tsinghua.edu.cn"
+ARG GITHUB_PROXY=""
 
 # OpenResty build knobs adapted from upstream packaging defaults.
 ARG RESTY_CONFIG_OPTIONS="\
@@ -185,21 +186,21 @@ RUN set -eux; \
 RUN cd /tmp \
     && if [ -n "${RESTY_EVAL_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_PRE_CONFIGURE}); fi \
     && cd /tmp \
-    && curl -fSL "${RESTY_OPENSSL_URL_BASE}/openssl-${RESTY_OPENSSL_VERSION}.tar.gz" -o openssl-${RESTY_OPENSSL_VERSION}.tar.gz \
+    && curl -fSL "${GITHUB_PROXY}${RESTY_OPENSSL_URL_BASE}/openssl-${RESTY_OPENSSL_VERSION}.tar.gz" -o openssl-${RESTY_OPENSSL_VERSION}.tar.gz \
     && tar xzf openssl-${RESTY_OPENSSL_VERSION}.tar.gz \
     && cd openssl-${RESTY_OPENSSL_VERSION} \
     && if [ $(echo ${RESTY_OPENSSL_VERSION} | cut -c 1-2) = "3." ] ; then \
         echo 'patching OpenSSL 3.x for OpenResty' \
-        && curl -s https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
+        && curl -s ${GITHUB_PROXY}https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
     fi \
     && if [ $(echo ${RESTY_OPENSSL_VERSION} | cut -c 1-5) = "1.1.1" ] ; then \
         echo 'patching OpenSSL 1.1.1 for OpenResty' \
-        && curl -s https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
+        && curl -s ${GITHUB_PROXY}https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
     fi \
     && if [ $(echo ${RESTY_OPENSSL_VERSION} | cut -c 1-5) = "1.1.0" ] ; then \
         echo 'patching OpenSSL 1.1.0 for OpenResty' \
-        && curl -s https://raw.githubusercontent.com/openresty/openresty/ed328977028c3ec3033bc25873ee360056e247cd/patches/openssl-1.1.0j-parallel_build_fix.patch | patch -p1 \
-        && curl -s https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
+        && curl -s ${GITHUB_PROXY}https://raw.githubusercontent.com/openresty/openresty/ed328977028c3ec3033bc25873ee360056e247cd/patches/openssl-1.1.0j-parallel_build_fix.patch | patch -p1 \
+        && curl -s ${GITHUB_PROXY}https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-${RESTY_OPENSSL_PATCH_VERSION}-sess_set_get_cb_yield.patch | patch -p1 ; \
     fi \
     && ./config \
       shared zlib -g \
@@ -210,7 +211,7 @@ RUN cd /tmp \
     && make -j${RESTY_J} \
     && make -j${RESTY_J} install_sw \
     && cd /tmp \
-    && curl -fSL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${RESTY_PCRE_VERSION}/pcre2-${RESTY_PCRE_VERSION}.tar.gz" -o pcre2-${RESTY_PCRE_VERSION}.tar.gz \
+    && curl -fSL "${GITHUB_PROXY}https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${RESTY_PCRE_VERSION}/pcre2-${RESTY_PCRE_VERSION}.tar.gz" -o pcre2-${RESTY_PCRE_VERSION}.tar.gz \
     && echo "${RESTY_PCRE_SHA256}  pcre2-${RESTY_PCRE_VERSION}.tar.gz" | sha256sum -c - \
     && tar xzf pcre2-${RESTY_PCRE_VERSION}.tar.gz \
     && cd /tmp/pcre2-${RESTY_PCRE_VERSION} \
@@ -221,7 +222,7 @@ RUN cd /tmp \
     && CFLAGS="-g -O3" make -j${RESTY_J} \
     && CFLAGS="-g -O3" make -j${RESTY_J} install \
     && cd /tmp \
-    && curl -fSL "https://github.com/slact/nchan/archive/refs/tags/v${NCHAN_VERSION}.tar.gz" -o nchan.tar.gz \
+    && curl -fSL "${GITHUB_PROXY}https://github.com/slact/nchan/archive/refs/tags/v${NCHAN_VERSION}.tar.gz" -o nchan.tar.gz \
     && tar xzf nchan.tar.gz \
     && mv nchan-${NCHAN_VERSION} nchan \
     && curl -fSL "https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz" -o openresty-${RESTY_VERSION}.tar.gz \
@@ -251,6 +252,41 @@ RUN cd /tmp \
     fi \
     && ln -sf /dev/stdout /usr/local/openresty/nginx/logs/access.log \
     && ln -sf /dev/stderr /usr/local/openresty/nginx/logs/error.log
+
+# ── Runtime stage ──
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS runtime
+
+LABEL maintainer="Claude Hub"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/home/claude
+ENV USER=claude
+ENV LOGNAME=claude
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
+
+ARG DEBIAN_MIRROR="http://mirrors.tuna.tsinghua.edu.cn"
+
+RUN set -eux; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+        "deb ${DEBIAN_MIRROR}/debian bookworm main contrib non-free non-free-firmware" \
+        "deb ${DEBIAN_MIRROR}/debian bookworm-updates main contrib non-free non-free-firmware" \
+        "deb ${DEBIAN_MIRROR}/debian-security bookworm-security main contrib non-free non-free-firmware" \
+        > /etc/apt/sources.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgd3 \
+        libgeoip1 \
+        libxslt1.1 \
+        nodejs \
+        npm \
+        ; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /var/run/openresty
+
+COPY --from=openresty-builder /usr/local/openresty /usr/local/openresty
 
 # Add additional binaries into PATH for convenience
 ENV PATH=$PATH:/usr/local/openresty/luajit/bin:/usr/local/openresty/nginx/sbin:/usr/local/openresty/bin

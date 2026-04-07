@@ -364,8 +364,8 @@ button.session-card {
   align-items: center;
 }
 
-/* ── Workspace ───────────────────────────────────── */
-.workspace {
+/* ── Hub layout ─────────────────────────────────── */
+.main-area {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
   min-width: 0;
@@ -1136,7 +1136,7 @@ button.session-card {
     transform: translateX(calc(-100% + 72px));
   }
 
-  .workspace {
+  .main-area {
     min-width: 0;
   }
 
